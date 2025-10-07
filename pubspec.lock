@@ -382,7 +382,7 @@ packages:
     source: hosted
     version: "1.0.0"
   http:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: http
       sha256: bb2ce4590bc2667c96f318d68cac1b5a7987ec819351d32b1c987239a815e007
@@ -590,7 +590,7 @@ packages:
     source: hosted
     version: "2.3.0"
   permission_handler:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: permission_handler
       sha256: bc917da36261b00137bbc8896bf1482169cd76f866282368948f032c8c1caae1

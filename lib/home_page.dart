@@ -1,899 +1,1283 @@
-// lib/home_page.dart
 import 'dart:async';
-import 'package:firebase_core/firebase_core.dart';
+
+/// SwiftX Express – Home dashboard
+///
+/// Flow (high‑level)
+/// 1) App boots (main.dart) → AppInitializer.init(..) + store user + register
+///    global background FCM handler.
+/// 2) HomePage.initState registers: foreground FCM listener, in‑app
+///    incoming‑call stream, OS call acceptance events, and Android
+///    consume-and-accept flow after process death.
+/// 3) Customer tab: create orders, view driver + timeline, press call to dial.
+/// 4) Driver tab: switch active driver, advance order status, call customer.
+/// 5) Calls:
+///    - Outgoing: _startCall (steps 1‑4 inside function).
+///    - Incoming (foreground): _observeIncomingCalls → open CallScreen.
+///    - Incoming (OS UI accept): _observeCallKitEvents → open CallScreen.
+///    - Incoming (Android app killed): _consumeAcceptedCallFromTerminated.
+
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:stream_video_flutter/stream_video_flutter.dart';
 import 'package:stream_video_push_notification/stream_video_push_notification.dart';
-import 'package:stream_video_test/app_initializer.dart';
 import 'package:uuid/uuid.dart';
 
-import 'call_lifecycle.dart';
-import 'call_display_utils.dart';
 import 'call_screen.dart';
-import 'app_keys.dart';
-import 'firebase_options.dart';
+import 'delivery_models.dart';
 import 'tutorial_user.dart';
+import 'dev_manual_auth.dart';
 
 class HomePage extends StatefulWidget {
   final StreamVideo client;
-
   const HomePage({super.key, required this.client});
 
   @override
-  State<HomePage> createState() => _HomeScreenState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class _HomeScreenState extends State<HomePage> {
-  bool _isJoining = false;
+class _HomePageState extends State<HomePage> {
+  final _uuid = const Uuid();
   bool _permissionsGranted = false;
   bool _isVideoCall = true;
-  final List<String> _selectedUserIds = [];
-  final Subscriptions _subscriptions = Subscriptions();
-  StreamSubscription<StreamCallEvent>? _callEventsSubscription;
-  StreamSubscription<CallState>? _callStateSubscription;
-  CallLifecycleStage _callLifecycleStage = CallLifecycleStage.idle;
-  String? _callLifecycleDetails = 'Ready for new calls';
 
-  static const int _fcmSubscription = 1;
-  static const int _callKitSubscription = 2;
+  StreamSubscription<RemoteMessage>? _fcmFgSub;
+  StreamSubscription<Call?>? _incomingCallSub;
+  StreamSubscription<dynamic>? _callKitSub;
+
+  late final Map<String, TutorialUser> _userDirectory;
+  late final List<TutorialUser> _drivers;
+  late final List<DeliveryOrder> _orders;
+  late String _activeDriverId;
 
   @override
   void initState() {
     super.initState();
+
+    debugPrint('========================================');
+    debugPrint('🏠 HOME PAGE INITIALIZED');
+    debugPrint('Current User ID: ${widget.client.currentUser.id}');
+    debugPrint('Current User Name: ${widget.client.currentUser.name}');
+    debugPrint('========================================');
+
+    // Step 2.1 – Build an in‑memory directory of users
+    if (ManualAuth.enabled) {
+      // Use manual A/B users so IDs/names match dev_manual_auth.dart
+      final a = ManualAuth.userA;
+      final b = ManualAuth.userB;
+      final manualList = [
+        TutorialUser(
+          user: User.regular(userId: a.userId, name: a.name),
+          token: null,
+        ),
+        TutorialUser(
+          user: User.regular(userId: b.userId, name: b.name),
+          token: null,
+        ),
+      ];
+      _userDirectory = {for (final u in manualList) u.user.id: u};
+    } else {
+      _userDirectory = {
+        for (final user in TutorialUser.users) user.user.id: user,
+      };
+    }
+
+    final currentUserId = widget.client.currentUser.id;
+    _drivers =
+        _userDirectory.values
+            .where((user) => user.user.id != currentUserId)
+            .toList();
+    _activeDriverId =
+        _drivers.isNotEmpty ? _drivers.first.user.id : currentUserId;
+
+    // Step 2.2 – Seed a few demo orders
+    _orders = _seedInitialOrders();
+
+    // Step 2.3 – Permissions and listeners
     _checkPermissions();
-    _requestNotificationPermissions();
-    _tryConsumingIncomingCallFromTerminatedState();
-    _observeFcmMessages();
-    _observeCallKitEvents();
+    if (!kIsWeb) {
+      _requestNotificationPermissions();
+      _observeFcmMessages(); // Foreground FCM → in‑app notifications
+      _monitorFcmTokenChanges(); // Monitor FCM token registration
+    }
+    _observeIncomingCalls(); // Stream incoming call while app open
+    _observeCallKitEvents(); // OS accepts (CallKit/CS)
+    _consumeAcceptedCallFromTerminated(); // Android resume after process death
   }
 
   @override
   void dispose() {
-    _stopObservingCall();
-    _subscriptions.cancelAll();
+    _fcmFgSub?.cancel();
+    _incomingCallSub?.cancel();
+    _callKitSub?.cancel();
     super.dispose();
   }
 
-  Future<void> _checkPermissions() async {
-    final cameraStatus = await Permission.camera.status;
-    final microphoneStatus = await Permission.microphone.status;
+  List<DeliveryOrder> _seedInitialOrders() {
+    final now = DateTime.now();
+    final meId = widget.client.currentUser.id;
+    final primaryDriver = _drivers.isNotEmpty ? _drivers.first.user.id : meId;
+    final secondaryDriver =
+        _drivers.length > 1 ? _drivers[1].user.id : primaryDriver;
 
-    setState(() {
-      _permissionsGranted =
-          cameraStatus.isGranted && microphoneStatus.isGranted;
-    });
+    return <DeliveryOrder>[
+      DeliveryOrder(
+        code: 'SVX-${now.millisecondsSinceEpoch % 10000}'.padLeft(4, '0'),
+        packageSummary: 'เอกสารสัญญาด่วน',
+        pickupAddress: 'สยามสแควร์วัน',
+        dropOffAddress: 'ออฟฟิศ Stream (FYI Center)',
+        customerId: meId,
+        driverId: primaryDriver,
+        scheduledAt: now.subtract(const Duration(minutes: 12)),
+        eta: const Duration(minutes: 35),
+        stage: DeliveryStage.driverEnRoute,
+      ),
+      DeliveryOrder(
+        code: 'SVX-${(now.millisecondsSinceEpoch + 427) % 10000}'.padLeft(
+          4,
+          '0',
+        ),
+        packageSummary: 'อาหารแช่แข็ง (เก็บเย็น)',
+        pickupAddress: 'Warehouse Bangna',
+        dropOffAddress: 'The PARQ ชั้น 16',
+        customerId: meId,
+        driverId: secondaryDriver,
+        scheduledAt: now.subtract(const Duration(minutes: 3)),
+        eta: const Duration(minutes: 55),
+        stage: DeliveryStage.requested,
+      ),
+    ];
+  }
+
+  Future<void> _checkPermissions() async {
+    if (kIsWeb) {
+      // Browser will prompt on first media use; treat as granted for UI flow.
+      setState(() => _permissionsGranted = true);
+      return;
+    }
+    final cam = await Permission.camera.status;
+    final mic = await Permission.microphone.status;
+    setState(() => _permissionsGranted = cam.isGranted && mic.isGranted);
   }
 
   Future<void> _requestPermissions() async {
+    if (kIsWeb) return;
     final statuses = await [Permission.camera, Permission.microphone].request();
-    final allGranted = statuses.values.every((status) => status.isGranted);
-
-    setState(() {
-      _permissionsGranted = allGranted;
-    });
-
-    if (!allGranted) {
-      _showPermissionDialog();
+    final ok = statuses.values.every((s) => s.isGranted);
+    setState(() => _permissionsGranted = ok);
+    if (!ok && mounted) {
+      showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('ต้องการสิทธิ์กล้อง/ไมค์'),
+          content: const Text('อนุญาตการเข้าถึงเพื่อวิดีโอคอลกับไรเดอร์ได้อย่างสมบูรณ์'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('ปิด')),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                openAppSettings();
+              },
+              child: const Text('ไปที่การตั้งค่า'),
+            ),
+          ],
+        ),
+      );
     }
   }
 
   Future<void> _requestNotificationPermissions() async {
-    await FirebaseMessaging.instance.requestPermission(
+    final settings = await FirebaseMessaging.instance.requestPermission(
       alert: true,
-      announcement: false,
       badge: true,
-      carPlay: false,
-      criticalAlert: false,
-      provisional: false,
       sound: true,
     );
+
+    debugPrint('========================================');
+    debugPrint('🔔 NOTIFICATION PERMISSIONS STATUS');
+    debugPrint('Authorization: ${settings.authorizationStatus}');
+    debugPrint('Alert: ${settings.alert}');
+    debugPrint('Badge: ${settings.badge}');
+    debugPrint('Sound: ${settings.sound}');
+
+    // Get and log FCM token
+    final token = await FirebaseMessaging.instance.getToken();
+    debugPrint('FCM Token: ${token?.substring(0, 20)}...');
+    debugPrint('========================================');
+
+    if (CurrentPlatform.isAndroid) {
+      StreamVideoPushNotificationManager.ensureFullScreenIntentPermission();
+    }
   }
 
-  void _showPermissionDialog() {
-    showDialog<void>(
-      context: context,
-      builder:
-          (context) => AlertDialog(
-            title: const Text('Permissions Required'),
-            content: const Text(
-              'Camera and microphone permissions are required for video calls. '
-              'Please grant these permissions in your device settings.',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Cancel'),
-              ),
-              TextButton(
-                onPressed: () {
-                  Navigator.pop(context);
-                  openAppSettings();
-                },
-                child: const Text('Open Settings'),
-              ),
-            ],
-          ),
-    );
-  }
+  /// Monitor FCM token changes and registration with Stream
+  void _monitorFcmTokenChanges() {
+    // Listen to token refresh events
+    FirebaseMessaging.instance.onTokenRefresh.listen((newToken) {
+      debugPrint('========================================');
+      debugPrint('🔄 FCM TOKEN REFRESHED');
+      debugPrint('New Token (first 30 chars): ${newToken.substring(0, 30)}...');
+      debugPrint('========================================');
+    });
 
-  // Handle Firebase messaging for incoming calls
-  void _observeFcmMessages() {
-    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-    _subscriptions.add(
-      _fcmSubscription,
-      FirebaseMessaging.onMessage.listen(_handleRemoteMessage),
-    );
-  }
-
-  Future<bool> _handleRemoteMessage(RemoteMessage message) async {
-    return StreamVideo.instance.handleRingingFlowNotifications(message.data);
-  }
-
-  // Handle CallKit events for accepting/declining calls
-  void _observeCallKitEvents() {
-    final streamVideo = StreamVideo.instance;
-    _subscriptions.add(
-      _callKitSubscription,
-      streamVideo.observeCoreCallKitEvents(
-        onCallAccepted: (callToJoin) {
-          _setActiveCallAndNavigate(callToJoin, markAsAccepted: true);
-        },
-      ),
-    );
-  }
-
-  // Handle incoming calls when app is reopened from terminated state
-  void _tryConsumingIncomingCallFromTerminatedState() {
-    // This is only relevant for Android
-    if (CurrentPlatform.isIos) return;
-
-    WidgetsBinding.instance.addPostFrameCallback((timeStamp) {
-      StreamVideo.instance.consumeAndAcceptActiveCall(
-        onCallAccepted: (callToJoin) {
-          _setActiveCallAndNavigate(callToJoin, markAsAccepted: true);
-        },
-      );
+    // Get current token and verify it's registered
+    FirebaseMessaging.instance.getToken().then((token) {
+      if (token != null) {
+        debugPrint('========================================');
+        debugPrint('📱 CURRENT FCM TOKEN FOR ${widget.client.currentUser.name}');
+        debugPrint('User ID: ${widget.client.currentUser.id}');
+        debugPrint('Full Token: $token');
+        debugPrint('Token (first 30 chars): ${token.substring(0, 30)}...');
+        debugPrint('⚠️ IMPORTANT: This token should be automatically registered with Stream');
+        debugPrint('If you don\'t receive calls, check:');
+        debugPrint('1. Stream Dashboard has Push Provider named "niwner_notification"');
+        debugPrint('2. FCM Server Key is correct in Stream Dashboard');
+        debugPrint('3. Push Provider is enabled');
+        debugPrint('========================================');
+      } else {
+        debugPrint('❌ FCM TOKEN IS NULL! Push notifications will not work!');
+      }
     });
   }
 
-  // Create a ringing call
-  Future<void> _createRingingCall() async {
-    if (!_permissionsGranted) {
-      await _requestPermissions();
-      if (!_permissionsGranted) return;
-    }
+  /// Subscribe to foreground FCM messages so Stream can process ringing/missed
+  void _observeFcmMessages() {
+    _fcmFgSub = FirebaseMessaging.onMessage.listen(_handleRemoteMessage);
+  }
 
-    if (_selectedUserIds.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please select at least one user to call'),
+  Future<void> _handleRemoteMessage(RemoteMessage message) async {
+    debugPrint('========================================');
+    debugPrint('🔔 FOREGROUND FCM MESSAGE RECEIVED');
+    debugPrint('Message ID: ${message.messageId}');
+    debugPrint('Notification: ${message.notification?.title} - ${message.notification?.body}');
+    debugPrint('Message data: ${message.data}');
+    debugPrint('========================================');
+
+    await StreamVideo.instance.handleRingingFlowNotifications(message.data);
+
+    debugPrint('✅ Successfully handled ringing flow notification in foreground');
+  }
+
+  /// Step 2.3.3 – In‑app incoming call while app is open (foreground)
+  void _observeIncomingCalls() {
+    _incomingCallSub = StreamVideo.instance.state.incomingCall.listen((call) {
+      debugPrint('========================================');
+      debugPrint('📞 INCOMING CALL EVENT RECEIVED');
+      debugPrint('Call ID: ${call?.id}');
+      debugPrint('Call type: ${call?.type}');
+      debugPrint('Members: ${call?.state.value.callMembers.map((m) => m.userId).join(", ")}');
+      debugPrint('========================================');
+
+      if (!mounted || call == null) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => CallScreen(call: call, role: CallUiRole.callee),
         ),
       );
-      return;
-    }
-
-    setState(() {
-      _isJoining = true;
     });
+  }
 
-    try {
-      final call = StreamVideo.instance.makeCall(
-        callType: StreamCallType.defaultType(),
-        id: "niwner12345",
-      );
-
-      final targetNames = _formatSelectedParticipantNames();
-      _updateCallLifecycleStage(
-        CallLifecycleStage.ringing,
-        detail: targetNames.isNotEmpty ? 'Calling ' + targetNames : null,
-      );
-
-      _setActiveCallAndNavigate(call);
-
-      final result = await call.getOrCreate(
-        memberIds: _selectedUserIds,
-        video: _isVideoCall,
-        ringing: true,
-      );
-
-      await result.fold<Future<void>>(
-        success: (_) async {
-          final joinResult = await call.join();
-          await joinResult.fold<Future<void>>(
-            success: (_) async {},
-            failure: (failure) async {
-              _stopObservingCall();
-              _updateCallLifecycleStage(CallLifecycleStage.idle);
-              if (mounted) {
-                if (Navigator.of(context).canPop()) {
-                  Navigator.of(context).pop();
-                }
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text('Failed to join call: ${failure.error.message}'),
-                    backgroundColor: Colors.red,
-                  ),
-                );
-              }
-            },
-          );
-        },
-        failure: (failure) async {
-          _stopObservingCall();
-          _updateCallLifecycleStage(CallLifecycleStage.idle);
-          if (mounted) {
-            if (Navigator.of(context).canPop()) {
-              Navigator.of(context).pop();
-            }
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Failed to start call: ${failure.error.message}'),
-                backgroundColor: Colors.red,
-              ),
-            );
-          }
-        },
-      );
-
-    } catch (e) {
-      _stopObservingCall();
-      _updateCallLifecycleStage(CallLifecycleStage.idle);
-      if (mounted) {
-        if (Navigator.of(context).canPop()) {
-          Navigator.of(context).pop();
-        }
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error starting call: $e'),
-            backgroundColor: Colors.red,
+  /// Step 2.3.4 – Accept call from OS UI (CallKit/ConnectionService)
+  void _observeCallKitEvents() {
+    _callKitSub = StreamVideo.instance.observeCoreCallKitEvents(
+      onCallAccepted: (callToJoin) {
+        if (!mounted) return;
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder:
+                (_) => CallScreen(call: callToJoin, role: CallUiRole.callee),
           ),
         );
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isJoining = false;
-        });
-      }
-    }
+      },
+    );
   }
 
-  void _setActiveCallAndNavigate(Call call, {bool markAsAccepted = false}) {
-    _startObservingCall(call);
-    if (markAsAccepted && _callLifecycleStage != CallLifecycleStage.accepted) {
-      _updateCallLifecycleStage(
-        CallLifecycleStage.accepted,
-        detail: 'Joined call',
+  /// Step 2.3.5 – Android: app was killed, user accepted from OS → resume
+  void _consumeAcceptedCallFromTerminated() {
+    if (CurrentPlatform.isIos) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      StreamVideo.instance.consumeAndAcceptActiveCall(
+        onCallAccepted: (callToJoin) {
+          if (!mounted) return;
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder:
+                  (_) => CallScreen(call: callToJoin, role: CallUiRole.callee),
+            ),
+          );
+        },
       );
-    }
-    if (!mounted) return;
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (context) => CallScreen(call: call)));
-  }
-
-  void _startObservingCall(Call call) {
-    _callEventsSubscription?.cancel();
-    _callEventsSubscription = call.callEvents.listen(_handleCallEvent);
-
-    _callStateSubscription?.cancel();
-    _callStateSubscription = call.state.valueStream.listen(_handleCallState);
-
-    _handleCallState(call.state.value);
-  }
-
-  void _stopObservingCall() {
-    _callEventsSubscription?.cancel();
-    _callEventsSubscription = null;
-    _callStateSubscription?.cancel();
-    _callStateSubscription = null;
-  }
-
-  void _handleCallEvent(StreamCallEvent event) {
-    if (!mounted) return;
-
-    if (event is StreamCallRingingEvent) {
-      if (_callLifecycleStage != CallLifecycleStage.ringing) {
-        _updateCallLifecycleStage(
-          CallLifecycleStage.ringing,
-          detail: _callLifecycleDetails,
-        );
-      }
-    } else if (event is StreamCallAcceptedEvent) {
-      final acceptedBy = displayNameFromCallUser(event.acceptedBy);
-      _updateCallLifecycleStage(
-        CallLifecycleStage.accepted,
-        detail: 'Accepted by $acceptedBy',
-        announce: true,
-      );
-    } else if (event is StreamCallRejectedEvent) {
-      final rejectedBy = displayNameFromCallUser(event.rejectedBy);
-      _updateCallLifecycleStage(
-        CallLifecycleStage.rejected,
-        detail: 'Rejected by $rejectedBy',
-        announce: true,
-      );
-    } else if (event is StreamCallMissedEvent) {
-      final missedBy = formatNameList(
-        event.members
-            .map((member) => displayNameFromUserId(member.userId))
-            .toList(),
-      );
-      _updateCallLifecycleStage(
-        CallLifecycleStage.missed,
-        detail: missedBy.isNotEmpty ? 'Missed by $missedBy' : null,
-        announce: true,
-      );
-    } else if (event is StreamCallEndedEvent) {
-      final endedBy =
-          event.endedBy != null
-              ? displayNameFromCallUser(event.endedBy!)
-              : 'System';
-      final reasonText = (event.reason ?? event.type).toLowerCase();
-
-      if (reasonText.contains('cancel')) {
-        _updateCallLifecycleStage(
-          CallLifecycleStage.cancelled,
-          detail: 'Cancelled by $endedBy',
-          announce: true,
-        );
-      } else if (!_callLifecycleStage.isTerminal) {
-        _updateCallLifecycleStage(
-          CallLifecycleStage.ended,
-          detail: 'Ended by $endedBy',
-          announce: true,
-        );
-      }
-    }
-  }
-
-  void _handleCallState(CallState state) {
-    final status = state.status;
-
-    if (!_callLifecycleStage.isTerminal) {
-      if ((status.isOutgoing || state.isRingingFlow) &&
-          _callLifecycleStage != CallLifecycleStage.ringing) {
-        _updateCallLifecycleStage(
-          CallLifecycleStage.ringing,
-          detail: _callLifecycleDetails,
-        );
-      }
-
-      if ((status.isJoined || status.isConnected) &&
-          _callLifecycleStage != CallLifecycleStage.accepted) {
-        final connectedNames =
-            state.callParticipants
-                .where((participant) => !participant.isLocal)
-                .map((participant) {
-                  final trimmed = participant.name.trim();
-                  if (trimmed.isNotEmpty) {
-                    return trimmed;
-                  }
-                  return displayNameFromUserId(participant.userId);
-                })
-                .where((name) => name.isNotEmpty)
-                .toList();
-
-        final detail =
-            connectedNames.isEmpty
-                ? null
-                : 'Connected with ${formatNameList(connectedNames)}';
-
-        _updateCallLifecycleStage(CallLifecycleStage.accepted, detail: detail);
-      }
-    }
-
-    if (status is CallStatusDisconnected && !_callLifecycleStage.isTerminal) {
-      final reason = status.reason;
-      if (reason is DisconnectReasonCancelled) {
-        final by = displayNameFromUserId(reason.byUserId);
-        _updateCallLifecycleStage(
-          CallLifecycleStage.cancelled,
-          detail: 'Cancelled by $by',
-          announce: true,
-        );
-      } else if (reason is DisconnectReasonRejected) {
-        final by = displayNameFromUserId(reason.byUserId);
-        _updateCallLifecycleStage(
-          CallLifecycleStage.rejected,
-          detail: 'Rejected by $by',
-          announce: true,
-        );
-      } else if (reason is DisconnectReasonTimeout) {
-        _updateCallLifecycleStage(
-          CallLifecycleStage.missed,
-          detail: null,
-          announce: true,
-        );
-      } else {
-        _updateCallLifecycleStage(
-          CallLifecycleStage.ended,
-          detail: null,
-          announce: true,
-        );
-      }
-    }
-  }
-
-  void _updateCallLifecycleStage(
-    CallLifecycleStage stage, {
-    String? detail,
-    bool announce = false,
-  }) {
-    final trimmedDetail =
-        detail != null && detail.trim().isNotEmpty ? detail.trim() : null;
-    final fallbackDetail = stage.defaultDetail;
-    final nextDetail = trimmedDetail ?? fallbackDetail;
-
-    if (_callLifecycleStage == stage && _callLifecycleDetails == nextDetail) {
-      return;
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _callLifecycleStage = stage;
-      _callLifecycleDetails = nextDetail;
     });
-
-    if (stage.isTerminal) {
-      _stopObservingCall();
-    }
-
-    if (announce) {
-      final message =
-          nextDetail != null ? '${stage.label}: $nextDetail' : stage.label;
-      _showStatusSnackBar(message);
-    }
   }
 
-  void _showStatusSnackBar(String message) {
+  void _notify(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
-  String _formatSelectedParticipantNames() {
-    return formatNameList(_selectedUserIds.map(displayNameFromUserId).toList());
+  TutorialUser? _userFor(String id) => _userDirectory[id];
+
+  String _displayName(String id) =>
+      _userFor(id)?.user.name?.trim().isNotEmpty == true
+          ? _userFor(id)!.user.name!
+          : id;
+
+  String? _avatarUrl(String id) => _userFor(id)?.user.image;
+
+  String _formatEta(DeliveryOrder order) {
+    final remaining = order.remainingEta;
+    if (remaining == Duration.zero) {
+      return 'ถึงที่หมายแล้ว';
+    }
+    final minutes = remaining.inMinutes;
+    if (minutes <= 1) return 'เหลือไม่ถึง 1 นาที';
+    if (minutes < 60) return 'อีก $minutes นาที';
+    final hours = remaining.inHours;
+    final remMinutes = remaining.inMinutes.remainder(60);
+    return 'อีก $hours ชม. ${remMinutes.toString().padLeft(2, '0')} นาที';
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final currentUser = widget.client.currentUser;
-    final availableUsers =
-        TutorialUser.users
-            .where((user) => user.user.id != currentUser.id)
-            .toList();
+  //ตรวจสิทธิ์ กล้อง/ไมค์
+  /// Outgoing call flow (1‑1 voice/video)
+  /// Steps inside this function:
+  /// 1) Guard rails – validate member list, permissions, avoid active/outgoing
+  ///    call duplication.
+  /// 2) Create call object via StreamVideo.makeCall.
+  /// 3) getOrCreate(ringing: true) → triggers push & ringing flow.
+  /// 4) Navigate to CallScreen(role: caller).
+  Future<void> _startCall({
+    required Iterable<String> memberIds,
+    bool? video,
+  }) async {
+    final uniqueMembers =
+        memberIds.toSet()..remove(widget.client.currentUser.id);
+    if (uniqueMembers.isEmpty) {
+      _notify('ไม่พบปลายทางที่จะโทรหา');
+      return;
+    }
 
-    return Scaffold(
-      backgroundColor: Colors.grey.shade100,
-      appBar: AppBar(
-        title: const Text('Ringing Tutorial'),
-        backgroundColor: Colors.blue.shade600,
-        foregroundColor: Colors.white,
-        elevation: 2,
-        centerTitle: true,
+    if (!_permissionsGranted) {
+      await _requestPermissions();
+      if (!_permissionsGranted) return;
+    }
+
+    final activeCall = StreamVideo.instance.activeCall;
+    if (activeCall != null) {
+      _notify('มีสายกำลังทำงานอยู่');
+      return;
+    }
+
+    final outgoingCall = StreamVideo.instance.state.outgoingCall.valueOrNull;
+    if (outgoingCall != null) {
+      _notify('กำลังโทรออกอยู่แล้ว');
+      return;
+    }
+
+    // Use a deterministic 1v1 call-id in manual mode to aid debugging.
+    String callId;
+    if (ManualAuth.enabled && uniqueMembers.length == 1) {
+      final sorted = [widget.client.currentUser.id, uniqueMembers.first]..sort();
+      callId = '1v1-${sorted.join('-')}';
+    } else {
+      callId = 'svx-${_uuid.v4()}';
+    }
+
+    final call = StreamVideo.instance.makeCall(
+      callType: StreamCallType.defaultType(),
+      id: callId,
+    );
+
+    // Navigate first for faster perceived response; create the call in background.
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CallScreen(call: call, role: CallUiRole.caller),
       ),
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            return SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(minHeight: constraints.maxHeight),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    _buildHeaderSection(currentUser),
-                    const SizedBox(height: 32),
-                    _buildCallInfoSection(currentUser),
-                    const SizedBox(height: 24),
-                    _buildUserSelection(availableUsers),
-                    const SizedBox(height: 24),
-                    _buildCallTypeSelection(),
-                    const SizedBox(height: 24),
-                    _buildPermissionStatus(),
-                    const SizedBox(height: 24),
-                    _buildCallButton(),
-                    const SizedBox(height: 24),
-                  ],
-                ),
-              ),
-            );
-          },
-        ),
-      ),
+    );
+
+    final members = uniqueMembers.toList();
+    final wantsVideo = video ?? _isVideoCall;
+    final startedAt = DateTime.now();
+    debugPrint('========================================');
+    debugPrint('📞 STARTING OUTGOING CALL');
+    debugPrint('Call ID: $callId');
+    debugPrint('Members: $members');
+    debugPrint('Video enabled: $wantsVideo');
+    debugPrint('Ringing mode: true');
+    debugPrint('========================================');
+
+    unawaited(
+      call
+          .getOrCreate(
+            memberIds: members,
+            // Use ringing=true to emit in-app incoming call events for the callee
+            ringing: true,
+            video: wantsVideo,
+          )
+          .then((_) {
+        final ms = DateTime.now().difference(startedAt).inMilliseconds;
+        debugPrint('✅ Call created successfully (${ms}ms) id=$callId');
+      }).catchError((error, stack) {
+        debugPrint('❌ Failed to create call: $error\n$stack');
+        _notify('โทรออกไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
+      }),
     );
   }
 
-  Widget _buildHeaderSection(UserInfo currentUser) {
-    final name = currentUser.name.trim();
-    final greetingName = name.isNotEmpty ? name : currentUser.id;
+  /// Driver action – advance order to next allowed stage (guarding backward
+  /// or duplicate transitions). Updates UI on success.
+  void _advanceOrder(DeliveryOrder order, {DeliveryStage? toStage}) {
+    final changed = order.advance(toStage);
+    if (!changed) {
+      _notify('สถานะล่าสุดถูกอัปเดตแล้ว');
+      return;
+    }
+    setState(() {});
+  }
 
-    return Container(
-      padding: const EdgeInsets.all(24),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Colors.blue.shade600, Colors.blue.shade400],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.blue.withOpacity(0.3),
-            spreadRadius: 2,
-            blurRadius: 8,
-            offset: const Offset(0, 4),
+  /// Cancel order if not already delivered/cancelled; updates UI on success.
+  void _cancelOrder(DeliveryOrder order) {
+    final cancelled = order.cancel();
+    if (!cancelled) {
+      _notify('ไม่สามารถยกเลิกได้ในขณะนี้');
+      return;
+    }
+    setState(() {});
+  }
+
+  /// Create a new demo order and assign it round‑robin to available drivers.
+  void _createNewOrder() {
+    final meId = widget.client.currentUser.id;
+    final driverId =
+        _drivers.isNotEmpty
+            ? _drivers[_orders.length % _drivers.length].user.id
+            : meId;
+    final now = DateTime.now();
+    final newOrder = DeliveryOrder(
+      code: 'SVX-${_uuid.v4().substring(0, 6).toUpperCase()}',
+      packageSummary: 'พัสดุด่วน ${_orders.length + 1}',
+      pickupAddress: 'จุดรับ ${_orders.length + 5}',
+      dropOffAddress: 'จุดส่ง ${_orders.length + 12}',
+      customerId: meId,
+      driverId: driverId,
+      scheduledAt: now,
+      eta: const Duration(minutes: 45),
+    );
+    setState(() => _orders.insert(0, newOrder));
+    _notify('สร้างออเดอร์ใหม่เรียบร้อย');
+  }
+
+  /// Customer tab – list my orders, contact driver, create new order.
+  Widget _buildCustomerView() {
+    final meId = widget.client.currentUser.id;
+    final orders = _orders.where((order) => order.customerId == meId).toList();
+    if (orders.isEmpty) {
+      return _buildEmptyState(
+        context,
+        message: 'ยังไม่มีรายการจัดส่ง สร้างงานแรกของคุณได้เลย',
+        action: FilledButton.icon(
+          onPressed: _createNewOrder,
+          style: FilledButton.styleFrom(
+            backgroundColor: Theme.of(context).colorScheme.primary,
+            foregroundColor: Theme.of(context).colorScheme.onPrimary,
+            padding: const EdgeInsets.symmetric(
+              horizontal: 28,
+              vertical: 16,
+            ),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+            ),
+            elevation: 6,
+            shadowColor: Theme.of(context).colorScheme.primary.withValues(alpha: .4),
           ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Hello $greetingName!',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 24,
+          icon: const Icon(Icons.add_rounded, size: 24),
+          label: const Text(
+            'สร้างออเดอร์ด่วน',
+            style: TextStyle(
               fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Select users to ring and start a call',
-            style: TextStyle(color: Colors.white70, fontSize: 16),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCallInfoSection(UserInfo currentUser) {
-    final name = currentUser.name.trim();
-    final displayName = name.isNotEmpty ? name : 'No name';
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 1,
-            blurRadius: 4,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Call Information',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: Colors.grey.shade800,
-            ),
-          ),
-          const SizedBox(height: 12),
-          _buildInfoRow('User ID:', currentUser.id),
-          const SizedBox(height: 8),
-          _buildInfoRow('User Name:', displayName),
-          const SizedBox(height: 8),
-          _buildInfoRow(
-            'Selected:',
-            _selectedUserIds.isEmpty
-                ? 'None selected'
-                : '${_selectedUserIds.length} user(s)',
-          ),
-          const SizedBox(height: 16),
-          _buildStatusRow(),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildUserSelection(List<TutorialUser> availableUsers) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 1,
-            blurRadius: 4,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Select who would you like to ring?',
-            style: TextStyle(
               fontSize: 16,
-              fontWeight: FontWeight.w600,
-              color: Colors.grey.shade800,
             ),
           ),
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children:
-                availableUsers.map((user) {
-                  final isSelected = _selectedUserIds.contains(user.user.id);
-                  return ElevatedButton(
-                    onPressed: () {
-                      setState(() {
-                        if (isSelected) {
-                          _selectedUserIds.remove(user.user.id);
-                        } else {
-                          _selectedUserIds.add(user.user.id);
-                        }
-                      });
-                    },
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor:
-                          isSelected
-                              ? Colors.blue.shade600
-                              : Colors.grey.shade200,
-                      foregroundColor:
-                          isSelected ? Colors.white : Colors.grey.shade800,
-                      elevation: isSelected ? 2 : 0,
-                    ),
-                    child: Text(user.user.name ?? user.user.id),
-                  );
-                }).toList(),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCallTypeSelection() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 1,
-            blurRadius: 4,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Call Type',
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-              color: Colors.grey.shade800,
-            ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      _isVideoCall = true;
-                    });
-                  },
-                  icon: const Icon(Icons.videocam),
-                  label: const Text('Video'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor:
-                        _isVideoCall
-                            ? Colors.blue.shade600
-                            : Colors.grey.shade200,
-                    foregroundColor:
-                        _isVideoCall ? Colors.white : Colors.grey.shade800,
-                    elevation: _isVideoCall ? 2 : 0,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      _isVideoCall = false;
-                    });
-                  },
-                  icon: const Icon(Icons.call),
-                  label: const Text('Audio'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor:
-                        !_isVideoCall
-                            ? Colors.blue.shade600
-                            : Colors.grey.shade200,
-                    foregroundColor:
-                        !_isVideoCall ? Colors.white : Colors.grey.shade800,
-                    elevation: !_isVideoCall ? 2 : 0,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildPermissionStatus() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color:
-            _permissionsGranted ? Colors.green.shade50 : Colors.orange.shade50,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color:
-              _permissionsGranted
-                  ? Colors.green.shade300
-                  : Colors.orange.shade300,
-        ),
-      ),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Icon(
-                _permissionsGranted ? Icons.check_circle : Icons.warning,
-                color: _permissionsGranted ? Colors.green : Colors.orange,
-                size: 24,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  _permissionsGranted
-                      ? 'All permissions granted'
-                      : 'Permissions required',
-                  style: TextStyle(
-                    color:
-                        _permissionsGranted
-                            ? Colors.green.shade800
-                            : Colors.orange.shade800,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 16,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            _permissionsGranted
-                ? 'Camera and microphone access granted. Ready to start calls!'
-                : 'Camera and microphone permissions are required for video calls.',
-            style: TextStyle(
-              color:
-                  _permissionsGranted
-                      ? Colors.green.shade700
-                      : Colors.orange.shade700,
-              fontSize: 14,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCallButton() {
-    if (_isJoining) {
-      return Center(
-        child: Column(
-          children: [
-            CircularProgressIndicator(
-              valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade600),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              'Starting call...',
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
-            ),
-          ],
         ),
       );
     }
 
-    return ElevatedButton.icon(
-      onPressed:
-          _selectedUserIds.isEmpty
-              ? null
-              : (_permissionsGranted
-                  ? _createRingingCall
-                  : _requestPermissions),
-      icon: Icon(_permissionsGranted ? Icons.call : Icons.security, size: 24),
-      label: Text(
-        _permissionsGranted ? 'RING' : 'Grant Permissions',
-        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-      ),
-      style: ElevatedButton.styleFrom(
-        backgroundColor:
-            _permissionsGranted && _selectedUserIds.isNotEmpty
-                ? Colors.blue.shade600
-                : Colors.orange.shade600,
-        foregroundColor: Colors.white,
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        elevation: 2,
-      ),
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
+      physics: const BouncingScrollPhysics(),
+      itemBuilder: (context, index) {
+        final order = orders[index];
+        return _buildCustomerOrderCard(context, order);
+      },
+      separatorBuilder: (_, __) => const SizedBox(height: 18),
+      itemCount: orders.length,
     );
   }
 
-  Widget _buildStatusRow() {
-    final detail = _callLifecycleDetails;
-    final accent = _callLifecycleStage.accentColor;
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
+  /// Driver tab – switch active driver, see assigned orders, advance status.
+  Widget _buildDriverView() {
+    final theme = Theme.of(context);
+    final driverOrders =
+        _orders.where((order) => order.driverId == _activeDriverId).toList();
+
+    return Column(
       children: [
-        SizedBox(
-          width: 100,
-          child: Text(
-            'Status:',
-            style: TextStyle(
-              color: Colors.grey.shade600,
-              fontWeight: FontWeight.w500,
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+          child: Card(
+            elevation: 6,
+            clipBehavior: Clip.antiAlias,
+            shadowColor: theme.colorScheme.secondary.withValues(alpha: .25),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
             ),
-          ),
-        ),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Container(
-                decoration: BoxDecoration(
-                  color: accent.withOpacity(0.12),
-                  borderRadius: BorderRadius.circular(12),
+            child: Container(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    theme.colorScheme.secondaryContainer.withValues(alpha: .3),
+                    Colors.white,
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
                 ),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 6,
-                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
                 child: Row(
-                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(_callLifecycleStage.icon, color: accent, size: 18),
-                    const SizedBox(width: 8),
-                    Text(
-                      _callLifecycleStage.label,
-                      style: TextStyle(
-                        color: accent,
-                        fontWeight: FontWeight.w600,
+                    Container(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          colors: [
+                            theme.colorScheme.secondary.withValues(alpha: .25),
+                            theme.colorScheme.secondary.withValues(alpha: .15),
+                          ],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: theme.colorScheme.secondary.withValues(alpha: .2),
+                            blurRadius: 8,
+                            offset: const Offset(0, 3),
+                          ),
+                        ],
+                      ),
+                      child: CircleAvatar(
+                        radius: 24,
+                        backgroundColor: Colors.transparent,
+                        child: Icon(
+                          Icons.delivery_dining_rounded,
+                          color: theme.colorScheme.secondary,
+                          size: 28,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: DropdownButtonFormField<String>(
+                        value: _activeDriverId,
+                        decoration: InputDecoration(
+                          labelText: 'สลับบทบาทไรเดอร์',
+                          labelStyle: TextStyle(
+                            color: theme.colorScheme.secondary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          filled: true,
+                          fillColor:
+                              theme.colorScheme.surface.withValues(alpha: .9),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 16,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                        dropdownColor: theme.colorScheme.surface,
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setState(() => _activeDriverId = value);
+                        },
+                        items:
+                            _drivers
+                                .map(
+                                  (driver) => DropdownMenuItem(
+                                    value: driver.user.id,
+                                    child: Text(
+                                      driver.user.name ?? driver.user.id,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                                .toList(),
                       ),
                     ),
                   ],
                 ),
               ),
-              if (detail != null && detail.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: Text(
-                    detail,
-                    style: TextStyle(
-                      color: Colors.grey.shade700,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Expanded(
+          child:
+              driverOrders.isEmpty
+                  ? _buildEmptyState(
+                      context,
+                      message: 'ยังไม่มีงานที่ได้รับมอบหมายให้ไรเดอร์คนนี้',
+                    )
+                  : ListView.separated(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+                      physics: const BouncingScrollPhysics(),
+                      itemBuilder: (context, index) {
+                        final order = driverOrders[index];
+                        return _buildDriverOrderCard(context, order);
+                      },
+                      separatorBuilder: (_, __) => const SizedBox(height: 18),
+                      itemCount: driverOrders.length,
+                    ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCustomerOrderCard(BuildContext context, DeliveryOrder order) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final driverName = _displayName(order.driverId);
+    final driverAvatar = _avatarUrl(order.driverId);
+    final stageColor = order.stage.accentColor;
+    final trimmedDriverName = driverName.trim();
+    final driverInitial =
+        trimmedDriverName.isNotEmpty ? trimmedDriverName[0].toUpperCase() : '?';
+
+    return Card(
+      elevation: 8,
+      clipBehavior: Clip.antiAlias,
+      shadowColor: colorScheme.primary.withValues(alpha: .3),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [
+              colorScheme.primaryContainer.withValues(alpha: .5),
+              colorScheme.secondaryContainer.withValues(alpha: .2),
+              Colors.white,
+            ],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: LinearGradient(
+                        colors: [
+                          colorScheme.primary.withValues(alpha: .3),
+                          colorScheme.secondary.withValues(alpha: .2),
+                        ],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: colorScheme.primary.withValues(alpha: .2),
+                          blurRadius: 12,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: CircleAvatar(
+                      radius: 30,
+                      backgroundColor: Colors.transparent,
+                      backgroundImage:
+                          driverAvatar != null ? NetworkImage(driverAvatar) : null,
+                      child: driverAvatar == null
+                          ? Text(
+                              driverInitial,
+                              style: theme.textTheme.titleLarge?.copyWith(
+                                    color: colorScheme.primary,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 22,
+                                  ) ??
+                                  TextStyle(
+                                    color: colorScheme.primary,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 22,
+                                  ),
+                            )
+                          : null,
                     ),
                   ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'ออเดอร์ ${order.code}',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.w700,
+                                color: colorScheme.onSurface,
+                              ) ??
+                              TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: colorScheme.onSurface,
+                              ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'ไรเดอร์: $driverName',
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                                color: colorScheme.onSurfaceVariant,
+                              ) ??
+                              TextStyle(color: colorScheme.onSurfaceVariant),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [
+                          stageColor.withValues(alpha: .25),
+                          stageColor.withValues(alpha: .15),
+                        ],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: stageColor.withValues(alpha: .3),
+                        width: 1.5,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: stageColor.withValues(alpha: .15),
+                          blurRadius: 8,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: Text(
+                      order.stage.label,
+                      style: TextStyle(
+                        color: stageColor,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              _buildAddressRow(
+                context,
+                icon: Icons.my_location_rounded,
+                title: 'สถานที่รับ',
+                detail: order.pickupAddress,
+              ),
+              const SizedBox(height: 10),
+              _buildAddressRow(
+                context,
+                icon: Icons.location_on_rounded,
+                title: 'ปลายทาง',
+                detail: order.dropOffAddress,
+              ),
+              const Divider(height: 32),
+              _buildTimeline(context, order),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () => _startCall(
+                        memberIds: [order.driverId],
+                        video: _isVideoCall,
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: colorScheme.primary,
+                        foregroundColor: colorScheme.onPrimary,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        elevation: 4,
+                        shadowColor: colorScheme.primary.withValues(alpha: .4),
+                      ),
+                      icon: Icon(
+                        _isVideoCall
+                            ? Icons.videocam_rounded
+                            : Icons.call_rounded,
+                        size: 22,
+                      ),
+                      label: Text(
+                        _isVideoCall ? 'วิดีโอคอล' : 'โทรหา',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 15,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  OutlinedButton.icon(
+                    onPressed: () => _notify('ส่งข้อความหาไรเดอร์เรียบร้อย'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: colorScheme.primary,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 14,
+                      ),
+                      side: BorderSide(
+                        color: colorScheme.primary.withValues(alpha: .5),
+                        width: 1.5,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                    icon: const Icon(Icons.chat_bubble_outline_rounded, size: 20),
+                    label: const Text(
+                      'แชท',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    _formatEta(order),
+                    style: theme.textTheme.labelLarge?.copyWith(
+                          color: colorScheme.onSurfaceVariant,
+                        ) ??
+                        TextStyle(color: colorScheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDriverOrderCard(BuildContext context, DeliveryOrder order) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final customerName = _displayName(order.customerId);
+    final customerAvatar = _avatarUrl(order.customerId);
+    final nextStage = order.nextStage;
+    final trimmedCustomerName = customerName.trim();
+    final customerInitial = trimmedCustomerName.isNotEmpty
+        ? trimmedCustomerName[0].toUpperCase()
+        : '?';
+
+    return Card(
+      elevation: 8,
+      clipBehavior: Clip.antiAlias,
+      shadowColor: colorScheme.secondary.withValues(alpha: .3),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [
+              colorScheme.secondaryContainer.withValues(alpha: .5),
+              colorScheme.tertiaryContainer.withValues(alpha: .2),
+              Colors.white,
+            ],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: LinearGradient(
+                        colors: [
+                          colorScheme.secondary.withValues(alpha: .3),
+                          colorScheme.tertiary.withValues(alpha: .2),
+                        ],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: colorScheme.secondary.withValues(alpha: .2),
+                          blurRadius: 12,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: CircleAvatar(
+                      radius: 28,
+                      backgroundColor: Colors.transparent,
+                      backgroundImage:
+                          customerAvatar != null ? NetworkImage(customerAvatar) : null,
+                      child: customerAvatar == null
+                          ? Text(
+                              customerInitial,
+                              style: theme.textTheme.titleLarge?.copyWith(
+                                    color: colorScheme.secondary,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 20,
+                                  ) ??
+                                  TextStyle(
+                                    color: colorScheme.secondary,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 20,
+                                  ),
+                            )
+                          : null,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'ออเดอร์ ${order.code}',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.w700,
+                                color: colorScheme.onSurface,
+                              ) ??
+                              TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: colorScheme.onSurface,
+                              ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'ลูกค้า: $customerName',
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                                color: colorScheme.onSurfaceVariant,
+                              ) ??
+                              TextStyle(color: colorScheme.onSurfaceVariant),
+                        ),
+                      ],
+                    ),
+                  ),
+                  PopupMenuButton<String>(
+                    onSelected: (value) {
+                      if (value == 'cancel') {
+                        _cancelOrder(order);
+                      }
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(
+                        value: 'cancel',
+                        child: Text('ยกเลิกงาน'),
+                      ),
+                    ],
+                    icon: const Icon(Icons.more_vert_rounded),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Text(
+                order.packageSummary,
+                style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: colorScheme.onSurface,
+                    ) ??
+                    TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: colorScheme.onSurface,
+                    ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                order.pickupAddress,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ) ??
+                    TextStyle(color: colorScheme.onSurfaceVariant),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                '→ ${order.dropOffAddress}',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ) ??
+                    TextStyle(color: colorScheme.onSurfaceVariant),
+              ),
+              const Divider(height: 32),
+              _buildStageBadges(order),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed:
+                          nextStage == null ? null : () => _advanceOrder(order),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: colorScheme.secondary,
+                        foregroundColor: colorScheme.onSecondary,
+                        disabledBackgroundColor: Colors.grey.shade300,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        elevation: 4,
+                        shadowColor: colorScheme.secondary.withValues(alpha: .4),
+                      ),
+                      icon: const Icon(Icons.play_arrow_rounded, size: 22),
+                      label: Text(
+                        nextStage?.driverButtonLabel ?? 'เสร็จสิ้น',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 15,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  OutlinedButton.icon(
+                    onPressed: () => _startCall(
+                      memberIds: [order.customerId],
+                      video: false,
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: colorScheme.secondary,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 14,
+                      ),
+                      side: BorderSide(
+                        color: colorScheme.secondary.withValues(alpha: .5),
+                        width: 1.5,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                    icon: const Icon(Icons.call_rounded, size: 20),
+                    label: const Text(
+                      'โทร',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    'อัปเดตล่าสุด ${_formatShortTime(context, order.lastUpdated)}',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                          color: colorScheme.onSurfaceVariant,
+                        ) ??
+                        TextStyle(color: colorScheme.onSurfaceVariant, fontSize: 12),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTimeline(BuildContext context, DeliveryOrder order) {
+    final stages = List<DeliveryStage>.from(kDeliveryProgression);
+    if (order.stage == DeliveryStage.cancelled &&
+        !stages.contains(DeliveryStage.cancelled)) {
+      stages.add(DeliveryStage.cancelled);
+    }
+
+    return Column(
+      children: [
+        for (int i = 0; i < stages.length; i++)
+          _buildTimelineRow(
+            context,
+            order,
+            stages[i],
+            isLast: i == stages.length - 1,
+          ),
+      ],
+    );
+  }
+
+  /// Timeline row – visual checkpoint + timestamp for each delivery stage.
+  Widget _buildTimelineRow(
+    BuildContext context,
+    DeliveryOrder order,
+    DeliveryStage stage, {
+    required bool isLast,
+  }) {
+    final reached = _isStageReached(order, stage);
+    final timestamp = order.timestampFor(stage);
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Column(
+          children: [
+            CircleAvatar(
+              radius: 16,
+              backgroundColor:
+                  reached ? stage.accentColor : Colors.grey.shade300,
+              child: Icon(
+                stage.icon,
+                size: 18,
+                color: reached ? Colors.white : Colors.black45,
+              ),
+            ),
+            if (!isLast)
+              Container(
+                width: 2,
+                height: 32,
+                color:
+                    reached
+                        ? stage.accentColor.withValues(alpha: .6)
+                        : Colors.grey.shade300,
+              ),
+          ],
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      stage.label,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: reached ? Colors.black87 : Colors.black54,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    if (timestamp != null)
+                      Text(
+                        _formatShortTime(context, timestamp),
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.black45,
+                        ),
+                      ),
+                  ],
                 ),
+                Text(
+                  stage.description,
+                  style: const TextStyle(color: Colors.black54, fontSize: 13),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Compact, readable badges that reflect reached stages for a quick glance.
+  Widget _buildStageBadges(DeliveryOrder order) {
+    final stages = List<DeliveryStage>.from(kDeliveryProgression);
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children:
+          stages.map((stage) {
+            final reached = _isStageReached(order, stage);
+            return Chip(
+              avatar: Icon(
+                stage.icon,
+                size: 18,
+                color: reached ? Colors.white : stage.accentColor,
+              ),
+              backgroundColor:
+                  reached
+                      ? stage.accentColor
+                      : stage.accentColor.withValues(alpha: .15),
+              label: Text(
+                stage.label,
+                style: TextStyle(
+                  color: reached ? Colors.white : stage.accentColor,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            );
+          }).toList(),
+    );
+  }
+
+  /// Generic address row for pickup/dropoff sections on cards.
+  Widget _buildAddressRow(
+    BuildContext context, {
+    required IconData icon,
+    required String title,
+    required String detail,
+  }) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    final titleStyle = theme.textTheme.labelLarge?.copyWith(
+          fontWeight: FontWeight.w600,
+          color: colorScheme.onSurface,
+        ) ??
+        TextStyle(
+          fontWeight: FontWeight.w600,
+          color: colorScheme.onSurface,
+        );
+
+    final detailStyle = theme.textTheme.bodyMedium?.copyWith(
+          color: colorScheme.onSurfaceVariant,
+        ) ??
+        TextStyle(color: colorScheme.onSurfaceVariant);
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            color: colorScheme.primary.withValues(alpha: .12),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: colorScheme.primary, size: 20),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: titleStyle),
+              const SizedBox(height: 2),
+              Text(detail, style: detailStyle),
             ],
           ),
         ),
@@ -901,77 +1285,486 @@ class _HomeScreenState extends State<HomePage> {
     );
   }
 
-  Widget _buildInfoRow(String label, String value) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SizedBox(
-          width: 100,
-          child: Text(
-            label,
-            style: TextStyle(
-              color: Colors.grey.shade600,
-              fontWeight: FontWeight.w500,
+  /// Reusable empty state with optional action widget.
+  Widget _buildEmptyState(
+    BuildContext context, {
+    required String message,
+    Widget? action,
+  }) {
+    final theme = Theme.of(context);
+
+    return Center(
+      child: Card(
+        elevation: 4,
+        color: theme.colorScheme.surface.withValues(alpha: .98),
+        shadowColor: theme.colorScheme.primary.withValues(alpha: .15),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(32),
+        ),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(32),
+            gradient: LinearGradient(
+              colors: [
+                theme.colorScheme.primaryContainer.withValues(alpha: .15),
+                Colors.white.withValues(alpha: .8),
+              ],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 48),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: LinearGradient(
+                      colors: [
+                        theme.colorScheme.primary.withValues(alpha: .2),
+                        theme.colorScheme.primary.withValues(alpha: .1),
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: theme.colorScheme.primary.withValues(alpha: .15),
+                        blurRadius: 16,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: CircleAvatar(
+                    radius: 48,
+                    backgroundColor: Colors.transparent,
+                    child: Icon(
+                      Icons.inbox_rounded,
+                      size: 48,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style:
+                      theme.textTheme.titleMedium?.copyWith(
+                        color: theme.colorScheme.onSurface,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      ) ??
+                      TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontWeight: FontWeight.bold,
+                      ),
+                ),
+                if (action != null) ...[
+                  const SizedBox(height: 28),
+                  action,
+                ],
+              ],
             ),
           ),
         ),
-        Expanded(
-          child: Text(
-            value,
-            style: TextStyle(
-              color: Colors.grey.shade800,
-              fontWeight: FontWeight.w400,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-// Background message handler - must be top-level function
-@pragma('vm:entry-point')
-Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-
-  try {
-    final tutorialUser = await AppInitializer.getStoredUser();
-    if (tutorialUser == null) return;
-
-    final streamVideo = StreamVideo(
-      AppKeys.streamApiKey,
-      user: tutorialUser.user,
-      userToken: tutorialUser.token ?? '',
-      options: const StreamVideoOptions(
-        keepConnectionsAliveWhenInBackground: true,
       ),
-      pushNotificationManagerProvider:
-          StreamVideoPushNotificationManager.create(
-            iosPushProvider: const StreamVideoPushProvider.apn(
-              name: AppKeys.iosPushProviderName,
-            ),
-            androidPushProvider: const StreamVideoPushProvider.firebase(
-              name: AppKeys.androidPushProviderName,
-            ),
-            pushParams: const StreamVideoPushParams(
-              appName: 'Stream Video Call',
-              ios: IOSParams(iconName: 'IconMask'),
-            ),
-            registerApnDeviceToken: true,
-          ),
-    )..connect();
-
-    final declineSubscription = streamVideo.observeCallDeclinedCallKitEvent();
-    streamVideo.disposeAfterResolvingRinging(
-      disposingCallback: () => declineSubscription?.cancel(),
     );
+  }
 
-    await StreamVideo.instance.handleRingingFlowNotifications(message.data);
-  } catch (e, stk) {
-    debugPrint('Error handling remote message: $e');
-    debugPrint(stk.toString());
+  /// Format timestamp into short time using current Material localization.
+  String _formatShortTime(BuildContext context, DateTime time) {
+    final localizations = MaterialLocalizations.of(context);
+    return localizations.formatTimeOfDay(TimeOfDay.fromDateTime(time));
+  }
+
+  /// Helper to decide if a stage is considered “reached” for visual cues.
+  bool _isStageReached(DeliveryOrder order, DeliveryStage stage) {
+    if (stage == DeliveryStage.cancelled) {
+      return order.stage == DeliveryStage.cancelled;
+    }
+    final currentIndex = kDeliveryProgression.indexOf(order.stage);
+    final stageIndex = kDeliveryProgression.indexOf(stage);
+    if (currentIndex == -1 || stageIndex == -1) {
+      return false;
+    }
+    return stageIndex <= currentIndex;
+  }
+
+  Future<void> _preflightCheck() async {
+    try {
+      if (!_permissionsGranted) {
+        await _requestPermissions();
+        if (!_permissionsGranted) {
+          _notify('ต้องอนุญาตกล้อง/ไมค์ก่อน');
+          return;
+        }
+      }
+
+      final me = widget.client.currentUser.id;
+      final callId = 'preflight-$me-${DateTime.now().millisecondsSinceEpoch}';
+      final call = StreamVideo.instance.makeCall(
+        callType: StreamCallType.defaultType(),
+        id: callId,
+      );
+      final startedAt = DateTime.now();
+      await call.getOrCreate(
+        memberIds: const <String>[],
+        ringing: false,
+        video: false,
+      );
+      final ms = DateTime.now().difference(startedAt).inMilliseconds;
+      _notify('Preflight OK ($ms ms) id=$callId');
+    } catch (e, st) {
+      debugPrint('Preflight failed: $e\n$st');
+      _notify('Preflight ล้มเหลว: $e');
+    }
+  }
+
+  void _showConfiguredUsers() {
+    final theme = Theme.of(context);
+    final isManual = ManualAuth.enabled;
+    final me = widget.client.currentUser.id;
+    final List<Map<String, String>> rows = [];
+
+    if (isManual) {
+      final a = ManualAuth.userA;
+      final b = ManualAuth.userB;
+      rows.addAll([
+        {
+          'label': 'Manual A',
+          'userId': a.userId,
+          'name': a.name,
+          'me': (me == a.userId) ? '•' : '',
+        },
+        {
+          'label': 'Manual B',
+          'userId': b.userId,
+          'name': b.name,
+          'me': (me == b.userId) ? '•' : '',
+        },
+      ]);
+    } else {
+      final users = TutorialUser.users;
+      for (final t in users) {
+        rows.add({
+          'label': 'Tutorial',
+          'userId': t.user.id,
+          'name': t.user.name ?? t.user.id,
+          'me': (me == t.user.id) ? '•' : '',
+        });
+      }
+    }
+
+    showModalBottomSheet(
+      context: context,
+      builder: (_) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'ผู้ใช้ที่พร้อมสำหรับทดสอบ',
+                style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              for (final r in rows) ...[
+                ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: Text(r['me']!.isNotEmpty ? 'ฉัน' : r['label']!),
+                  title: Text(r['name'] ?? ''),
+                  subtitle: Text('userId: ${r['userId']}'),
+                ),
+              ],
+              const SizedBox(height: 8),
+              Text(
+                'หมายเหตุ: โหมด Manual/Tutorial แสดงผู้ใช้ที่กำหนดในแอปเท่านั้น ไม่ใช่สถานะออนไลน์จริง',
+                style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        backgroundColor: theme.scaffoldBackgroundColor,
+        appBar: AppBar(
+          automaticallyImplyLeading: false,
+          titleSpacing: 24,
+          toolbarHeight: 110,
+          elevation: 8,
+          shadowColor: colorScheme.primary.withValues(alpha: .4),
+          flexibleSpace: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [
+                  colorScheme.primary,
+                  colorScheme.primary.withValues(alpha: .85),
+                  colorScheme.secondary,
+                ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: colorScheme.primary.withValues(alpha: .3),
+                  blurRadius: 20,
+                  offset: const Offset(0, 5),
+                ),
+              ],
+            ),
+          ),
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('SwiftX Express Console'),
+              const SizedBox(height: 4),
+              Text(
+                'แดชบอร์ดจัดการงานจัดส่งและการคอลแบบเรียลไทม์',
+                style: theme.textTheme.labelMedium?.copyWith(
+                      color: colorScheme.onPrimary.withValues(alpha: .82),
+                    ) ??
+                    TextStyle(
+                      color: colorScheme.onPrimary.withValues(alpha: .82),
+                    ),
+              ),
+            ],
+          ),
+          actions: [
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: colorScheme.onPrimary.withValues(alpha: .15),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: colorScheme.onPrimary.withValues(alpha: .25),
+                    width: 1.5,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: .1),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: IconButton(
+                  tooltip: 'สร้างออเดอร์ใหม่',
+                  onPressed: _createNewOrder,
+                  icon: const Icon(Icons.add_rounded, size: 26),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: colorScheme.onPrimary.withValues(alpha: .15),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: colorScheme.onPrimary.withValues(alpha: .25),
+                    width: 1.5,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: .1),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: IconButton(
+                  tooltip: 'ตรวจระบบโทร (Preflight)',
+                  onPressed: _preflightCheck,
+                  icon: const Icon(Icons.health_and_safety_rounded, size: 22),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: colorScheme.onPrimary.withValues(alpha: .15),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: colorScheme.onPrimary.withValues(alpha: .25),
+                    width: 1.5,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: .1),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: IconButton(
+                  tooltip: 'ดูรายชื่อสำหรับทดสอบ',
+                  onPressed: _showConfiguredUsers,
+                  icon: const Icon(Icons.people_alt_rounded, size: 22),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: colorScheme.onPrimary.withValues(alpha: .15),
+                  borderRadius: BorderRadius.circular(28),
+                  border: Border.all(
+                    color: colorScheme.onPrimary.withValues(alpha: .25),
+                    width: 1.5,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: .1),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      _isVideoCall
+                          ? Icons.videocam_rounded
+                          : Icons.call_rounded,
+                      color: colorScheme.onPrimary,
+                      size: 22,
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      _isVideoCall ? 'โหมดวิดีโอ' : 'โหมดเสียง',
+                      style: theme.textTheme.labelLarge?.copyWith(
+                            color: colorScheme.onPrimary,
+                            fontWeight: FontWeight.bold,
+                          ) ??
+                          TextStyle(
+                            color: colorScheme.onPrimary,
+                            fontWeight: FontWeight.bold,
+                          ),
+                    ),
+                    const SizedBox(width: 14),
+                    Transform.scale(
+                      scale: .95,
+                      child: Switch(
+                        value: _isVideoCall,
+                        onChanged: (value) => setState(() => _isVideoCall = value),
+                        activeColor: colorScheme.onPrimary,
+                        activeTrackColor:
+                            colorScheme.onPrimary.withValues(alpha: .35),
+                        inactiveThumbColor: colorScheme.onPrimary.withValues(alpha: .7),
+                        inactiveTrackColor:
+                            colorScheme.onPrimary.withValues(alpha: .2),
+                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+          bottom: PreferredSize(
+            preferredSize: const Size.fromHeight(96),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: colorScheme.onPrimary.withValues(alpha: .15),
+                  borderRadius: BorderRadius.circular(30),
+                  border: Border.all(
+                    color: colorScheme.onPrimary.withValues(alpha: .25),
+                    width: 1.5,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: .15),
+                      blurRadius: 12,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: TabBar(
+                  padding: const EdgeInsets.all(6),
+                  indicator: BoxDecoration(
+                    borderRadius: BorderRadius.circular(26),
+                    gradient: LinearGradient(
+                      colors: [
+                        colorScheme.onPrimary.withValues(alpha: .35),
+                        colorScheme.onPrimary.withValues(alpha: .25),
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: colorScheme.onPrimary.withValues(alpha: .2),
+                        blurRadius: 8,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  labelPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  labelStyle: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                  ),
+                  unselectedLabelStyle: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                  ),
+                  tabs: const [
+                    Tab(
+                      icon: Icon(Icons.shopping_bag_rounded, size: 24),
+                      text: 'ฝั่งลูกค้า',
+                    ),
+                    Tab(
+                      icon: Icon(Icons.delivery_dining_rounded, size: 24),
+                      text: 'ฝั่งไรเดอร์',
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        body: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                colorScheme.primaryContainer.withValues(alpha: .12),
+                theme.scaffoldBackgroundColor,
+              ],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+            ),
+          ),
+          child: TabBarView(
+            physics: const BouncingScrollPhysics(),
+            children: [
+              _buildCustomerView(),
+              _buildDriverView(),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
-
-
-

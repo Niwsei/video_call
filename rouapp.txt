@@ -1,0 +1,2 @@
+flutter run -d chrome --web-port 5002 --dart-define=MANUAL_AUTH=true --dart-define=MANUAL_AUTH_USER=A
+flutter run -d 23078PND5G --dart-define=MANUAL_AUTH=true --dart-define=MANUAL_AUTH_USER=B

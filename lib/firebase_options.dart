@@ -41,50 +41,48 @@ class DefaultFirebaseOptions {
   }
 
   static const FirebaseOptions web = FirebaseOptions(
-    apiKey: 'AIzaSyAxrtKk410jAhtPJl5AGboNyQ6OCWKxxqs',
-    appId: '1:465683453774:web:6c9082ee6d06f33016301f',
-    messagingSenderId: '465683453774',
-    projectId: 'niwnergetstream',
-    authDomain: 'niwnergetstream.firebaseapp.com',
-    storageBucket: 'niwnergetstream.firebasestorage.app',
-    measurementId: 'G-8NQK12R7DV',
+    apiKey: 'AIzaSyBdP49DiQZooBhvQaUpEzyhyVSjFFG1SSI',
+    appId: '1:564591146605:web:d3286f8cbde9b675313164',
+    messagingSenderId: '564591146605',
+    projectId: 'notificationforlailaolab',
+    authDomain: 'notificationforlailaolab.firebaseapp.com',
+    storageBucket: 'notificationforlailaolab.firebasestorage.app',
+    measurementId: 'G-R2GS1K0KTH',
   );
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyAA5BZa9CS2kkgHZVlb6wb2XAT2h0bMtDY',
-    appId: '1:465683453774:android:01f1903fb88ef2df16301f',
-    messagingSenderId: '465683453774',
-    projectId: 'niwnergetstream',
-    storageBucket: 'niwnergetstream.firebasestorage.app',
+    apiKey: 'AIzaSyA4aZDk18_7J8cAsWlRKaU3FklZDeDVR8o',
+    appId: '1:564591146605:android:d5cae495e35a69a5313164',
+    messagingSenderId: '564591146605',
+    projectId: 'notificationforlailaolab',
+    storageBucket: 'notificationforlailaolab.firebasestorage.app',
   );
 
   static const FirebaseOptions ios = FirebaseOptions(
-    apiKey: 'AIzaSyBpCxEkwZKDW8vUB7LtFSfe8GHfIwE1hag',
-    appId: '1:465683453774:ios:5394c0eaad1d67f016301f',
-    messagingSenderId: '465683453774',
-    projectId: 'niwnergetstream',
-    storageBucket: 'niwnergetstream.firebasestorage.app',
-    iosClientId: '465683453774-dbkdf6mhtrh14k8b0mceucp0kmb52qcr.apps.googleusercontent.com',
+    apiKey: 'AIzaSyDv36qID86PzG1d9IXQtdc7hWl0264nM8U',
+    appId: '1:564591146605:ios:975e5853f1e009de313164',
+    messagingSenderId: '564591146605',
+    projectId: 'notificationforlailaolab',
+    storageBucket: 'notificationforlailaolab.firebasestorage.app',
     iosBundleId: 'com.example.streamVideoTest',
   );
 
   static const FirebaseOptions macos = FirebaseOptions(
-    apiKey: 'AIzaSyBpCxEkwZKDW8vUB7LtFSfe8GHfIwE1hag',
-    appId: '1:465683453774:ios:5394c0eaad1d67f016301f',
-    messagingSenderId: '465683453774',
-    projectId: 'niwnergetstream',
-    storageBucket: 'niwnergetstream.firebasestorage.app',
-    iosClientId: '465683453774-dbkdf6mhtrh14k8b0mceucp0kmb52qcr.apps.googleusercontent.com',
+    apiKey: 'AIzaSyDv36qID86PzG1d9IXQtdc7hWl0264nM8U',
+    appId: '1:564591146605:ios:975e5853f1e009de313164',
+    messagingSenderId: '564591146605',
+    projectId: 'notificationforlailaolab',
+    storageBucket: 'notificationforlailaolab.firebasestorage.app',
     iosBundleId: 'com.example.streamVideoTest',
   );
 
   static const FirebaseOptions windows = FirebaseOptions(
-    apiKey: 'AIzaSyAxrtKk410jAhtPJl5AGboNyQ6OCWKxxqs',
-    appId: '1:465683453774:web:d93053715ec5358a16301f',
-    messagingSenderId: '465683453774',
-    projectId: 'niwnergetstream',
-    authDomain: 'niwnergetstream.firebaseapp.com',
-    storageBucket: 'niwnergetstream.firebasestorage.app',
-    measurementId: 'G-024DNX6J08',
+    apiKey: 'AIzaSyBdP49DiQZooBhvQaUpEzyhyVSjFFG1SSI',
+    appId: '1:564591146605:web:d00e9ab1f5585ba3313164',
+    messagingSenderId: '564591146605',
+    projectId: 'notificationforlailaolab',
+    authDomain: 'notificationforlailaolab.firebaseapp.com',
+    storageBucket: 'notificationforlailaolab.firebasestorage.app',
+    measurementId: 'G-Q088MD927V',
   );
 }
