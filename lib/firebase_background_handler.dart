@@ -1,19 +1,15 @@
-﻿// lib/firebase_background_handler.dart
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:stream_video_flutter/stream_video_flutter.dart';
-import 'package:stream_video_push_notification/stream_video_push_notification.dart';
 
 import 'app_initializer.dart';
-import 'app_keys.dart';
 import 'firebase_options.dart';
+import 'services/token_service.dart';
 
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
   if (kDebugMode) {
     print('Handling a background message: ${message.messageId}');
@@ -21,46 +17,31 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   }
 
   try {
-    final tutorialUser = await AppInitializer.getStoredUser();
-    if (tutorialUser == null) {
-      if (kDebugMode) {
-        print('No stored user found for background message');
-      }
-      return;
-    }
+    // Production: fetch a fresh Stream user token from backend and build user from it.
+    final auth = await TokenService.fetchStreamAuth();
 
-    final streamVideo = StreamVideo(
-      AppKeys.streamApiKey,
-      user: tutorialUser.user,
-      userToken: tutorialUser.token ?? '',
-      options: const StreamVideoOptions(
-        keepConnectionsAliveWhenInBackground: true,
-      ),
-      pushNotificationManagerProvider: StreamVideoPushNotificationManager.create(
-        iosPushProvider: const StreamVideoPushProvider.apn(
-          name: AppKeys.iosPushProviderName,
-        ),
-        androidPushProvider: const StreamVideoPushProvider.firebase(
-          name: AppKeys.androidPushProviderName,
-        ),
-        pushParams: const StreamVideoPushParams(
-          appName: 'Stream Video Call',
-          ios: IOSParams(iconName: 'IconMask'),
-        ),
-        registerApnDeviceToken: true,
-      ),
-    )..connect();
+    final user = User.regular(
+      userId: auth.userId,
+      name: auth.fullName ?? auth.userId,
+    );
 
-    final declineSubscription = streamVideo.observeCallDeclinedCallKitEvent();
-    streamVideo.disposeAfterResolvingRinging(
-      disposingCallback: () => declineSubscription?.cancel(),
+    final client = AppInitializer.createClient(
+      user: user,
+      apiKey: auth.apiKey,
+      userToken: auth.token,
+    );
+
+    // Ensure cleanup after resolving ringing flow
+    final declineSub = client.observeCallDeclinedCallKitEvent();
+    client.disposeAfterResolvingRinging(
+      disposingCallback: () => declineSub?.cancel(),
     );
 
     await StreamVideo.instance.handleRingingFlowNotifications(message.data);
-  } catch (e, stack) {
+  } catch (e, st) {
     if (kDebugMode) {
-      print('Error handling background message: $e');
-      print('Stack trace: $stack');
+      print('Background handler error: $e');
+      print(st);
     }
   }
 }

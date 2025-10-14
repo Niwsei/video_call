@@ -1,36 +1,26 @@
 {
   "project_info": {
-    "project_number": "465683453774",
-    "project_id": "niwnergetstream",
-    "storage_bucket": "niwnergetstream.firebasestorage.app"
+    "project_number": "564591146605",
+    "project_id": "notificationforlailaolab",
+    "storage_bucket": "notificationforlailaolab.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:465683453774:android:01f1903fb88ef2df16301f",
+        "mobilesdk_app_id": "1:564591146605:android:d5cae495e35a69a5313164",
         "android_client_info": {
           "package_name": "com.example.stream_video_test"
         }
       },
-      "oauth_client": [
-        {
-          "client_id": "465683453774-5uomuv04cj9l1l3pe0dtti7kp2bqejof.apps.googleusercontent.com",
-          "client_type": 3
-        }
-      ],
+      "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyAA5BZa9CS2kkgHZVlb6wb2XAT2h0bMtDY"
+          "current_key": "AIzaSyA4aZDk18_7J8cAsWlRKaU3FklZDeDVR8o"
         }
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": [
-            {
-              "client_id": "465683453774-5uomuv04cj9l1l3pe0dtti7kp2bqejof.apps.googleusercontent.com",
-              "client_type": 3
-            }
-          ]
+          "other_platform_oauth_client": []
         }
       }
     }
