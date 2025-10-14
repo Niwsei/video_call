@@ -180,7 +180,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _requestNotificationPermissions() async {
-    await FirebaseMessaging.instance.requestPermission(
+    final settings = await FirebaseMessaging.instance.requestPermission(
       alert: true,
       badge: true,
       sound: true,

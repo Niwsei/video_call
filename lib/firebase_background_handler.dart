@@ -12,8 +12,12 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
   if (kDebugMode) {
-    print('Handling a background message: ${message.messageId}');
+    print('========================================');
+    print('🔔 BACKGROUND FCM MESSAGE RECEIVED');
+    print('Message ID: ${message.messageId}');
+    print('Notification: ${message.notification?.title} - ${message.notification?.body}');
     print('Message data: ${message.data}');
+    print('========================================');
   }
 
   try {

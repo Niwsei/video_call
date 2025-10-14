@@ -1,39 +1,30 @@
-{
-  "project_info": {
-    "project_number": "465683453774",
-    "project_id": "niwnergetstream",
-    "storage_bucket": "niwnergetstream.firebasestorage.app"
-  },
-  "client": [
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:465683453774:android:01f1903fb88ef2df16301f",
-        "android_client_info": {
-          "package_name": "com.example.stream_video_test"
-        }
-      },
-      "oauth_client": [
-        {
-          "client_id": "465683453774-5uomuv04cj9l1l3pe0dtti7kp2bqejof.apps.googleusercontent.com",
-          "client_type": 3
-        }
-      ],
-      "api_key": [
-        {
-          "current_key": "AIzaSyAA5BZa9CS2kkgHZVlb6wb2XAT2h0bMtDY"
-        }
-      ],
-      "services": {
-        "appinvite_service": {
-          "other_platform_oauth_client": [
-            {
-              "client_id": "465683453774-5uomuv04cj9l1l3pe0dtti7kp2bqejof.apps.googleusercontent.com",
-              "client_type": 3
-            }
-          ]
-        }
-      }
-    }
-  ],
-  "configuration_version": "1"
-}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>API_KEY</key>
+	<string>AIzaSyDv36qID86PzG1d9IXQtdc7hWl0264nM8U</string>
+	<key>GCM_SENDER_ID</key>
+	<string>564591146605</string>
+	<key>PLIST_VERSION</key>
+	<string>1</string>
+	<key>BUNDLE_ID</key>
+	<string>com.example.streamVideoTest</string>
+	<key>PROJECT_ID</key>
+	<string>notificationforlailaolab</string>
+	<key>STORAGE_BUCKET</key>
+	<string>notificationforlailaolab.firebasestorage.app</string>
+	<key>IS_ADS_ENABLED</key>
+	<false></false>
+	<key>IS_ANALYTICS_ENABLED</key>
+	<false></false>
+	<key>IS_APPINVITE_ENABLED</key>
+	<true></true>
+	<key>IS_GCM_ENABLED</key>
+	<true></true>
+	<key>IS_SIGNIN_ENABLED</key>
+	<true></true>
+	<key>GOOGLE_APP_ID</key>
+	<string>1:564591146605:ios:975e5853f1e009de313164</string>
+</dict>
+</plist>
